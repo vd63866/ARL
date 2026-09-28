@@ -2,10 +2,18 @@
 
 AdaptiveRL trains, evaluates, and demonstrates an RL agent navigating
 a simulated 3D drone through obstacles toward a target waypoint.
+
+The root namespace intentionally stays small and free of optional RL
+dependencies. Import benchmark and evaluation features from their own
+subpackages, for example::
+
+    from adaptive_rl.benchmarking import run_learning_curve_benchmark
+    from adaptive_rl.evaluation import Evaluator
 """
 
 from adaptive_rl.config import (
     AlgorithmConfig,
+    BenchmarkConfig,
     ConfigError,
     EnvironmentConfig,
     EvaluationConfig,
@@ -28,6 +36,7 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     "AlgorithmConfig",
+    "BenchmarkConfig",
     "ConfigError",
     "DefaultOutcomePolicy",
     "EnvironmentConfig",

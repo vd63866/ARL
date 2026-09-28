@@ -65,6 +65,19 @@ pytest -v tests/
 pytest --cov=adaptive_rl --cov-report=term-missing tests/
 ```
 
+#### End-to-end smoke test
+`tests/test_e2e_smoke.py` drives the real CLI through the whole pipeline on the lightweight
+`configs/ci_smoke.yaml` (512 training steps, one obstacle): config & environment → `train` →
+checkpoint/metadata files on disk → checkpoint reload and `evaluate` → `evaluation.json` schema
+(finite `mean_reward`, rates in [0, 1]) → deterministic `demo-drone`. Each stage is a separate
+test whose failure message starts with the stage name (e.g. `[Stage 3: Artifact Verification]`),
+and all outputs go to a pytest temporary directory. It is the CI `smoke-test` job and takes well
+under a minute, so run it before opening a pull request that touches training, evaluation,
+checkpointing or the CLI:
+```bash
+pytest -v tests/test_e2e_smoke.py
+```
+
 ### 3.3 Code Quality & Formatting
 AdaptiveRL adheres to strict PEP 8 and static typing standards:
 ```bash

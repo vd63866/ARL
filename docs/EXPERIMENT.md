@@ -33,7 +33,121 @@ This document details the experimental methodology, hypotheses, benchmark variab
 
 ---
 
-## 3. Expected Results (Hypothesized Prior to Testing)
+## 3. PPO Learning-Curve Benchmark
+
+The budget benchmark trains a fresh PPO model from the same base configuration at each requested training budget. Every model is evaluated with the same ordered evaluation seed groups, episode count per seed, environment parameters, algorithm settings, and deterministic-action setting; evaluation uses the saved model and a separate fresh environment. `--eval-seeds` selects the seed groups; `--episodes` is the number of episodes run within each group and does not determine how many seeds are evaluated.
+
+A single training seed is shared by every budget: `--training-seed` (or `benchmark.training_seed`, falling back to `seed`) is written into each budget's configuration copy before training, and the legacy algorithm-level `parameters.seed` value is dropped so that budgets differ only in budget size. Differences between budgets therefore cannot be attributed to re-seeding. Training itself is not guaranteed bit-for-bit reproducible across hardware, PyTorch versions, or CUDA kernels.
+
+```bash
+adaptive-rl benchmark budgets \
+  --config configs/drone_ppo.yaml \
+  --budgets 5000,10000,25000,50000 \
+  --training-seed 42 \
+  --eval-seeds 42,43,44,45,46 \
+  --episodes 20 \
+  --deterministic
+```
+
+The command reports the budget list and output locations when complete. By default, machine-readable artifacts are written beneath `artifacts/benchmarks/`:
+
+```text
+Learning Curve Benchmark
+PPO learning-curve benchmark complete
+Budgets: 5,000, 10,000, 25,000, 50,000
+Training seed: 42
+Evaluation seeds: [42, 43, 44, 45, 46]
+JSON: artifacts/benchmarks/learning_curve_budget.json
+CSV: artifacts/benchmarks/learning_curve_budget.csv
+Plot: not generated
+
+artifacts/benchmarks/
+├── learning_curve_budget.json
+├── learning_curve_budget.csv
+└── learning_curve/
+    ├── budget_5000/models/ppo_budget_5000_final.zip
+    ├── budget_10000/models/ppo_budget_10000_final.zip
+    └── ...
+```
+
+JSON contains benchmark settings, one result object per completed budget, pooled metrics, per-seed summaries, cross-seed Student's t statistics, and plot-ready series. CSV contains the pooled per-budget performance values with provenance columns.
+
+The benchmark writes its JSON and CSV artifacts before attempting any plot and validates the JSON payload as strict JSON (finite numbers only, no NaN or Infinity, no non-native numeric types such as `float32` or `Path`), so an export failure cannot leave a half-written or unparseable report behind.
+
+**JSON schema.** The document has these top-level keys:
+
+| Key | Contents |
+|---|---|
+| `status` | `"completed"` when every requested budget finished, `"failed"` when the run stopped early |
+| `completed_budgets` | Budgets that trained and evaluated successfully, in run order |
+| `failed_budget` | The budget at which the run stopped, or `null` |
+| `error` | Sanitized `TypeName: message` for the failure (never a traceback), or `null` |
+| `benchmark` | Settings: `training_seed`, `evaluation_seeds`, `evaluation_group_seeds`, `evaluation_episodes`, `episodes_per_seed`, `deterministic`, `budgets`, plus the `seed_semantics`, `metric_semantics`, and `training_time_semantics` explanation strings |
+| `results` | One object per completed budget (see below) |
+| `plot` | `requested` (bool), `path`, and `error` for the optional figure |
+| `plot_data` | Plot-ready series: `budgets`, `trained_timesteps`, `success_rate`, `mean_reward` |
+
+Each `results` object carries `budget_timesteps`, `trained_timesteps`, the pooled metrics (`success_rate`, `collision_rate`, `timeout_rate`, `mean_reward`, `std_reward`, `mean_episode_length`), `training_time_seconds`, `model_path`, `training_seed`, `evaluation_seeds`, `evaluation_episodes`, `deterministic`, `algorithm`, `environment`, `descriptive_metrics`, `per_seed_summaries`, `cross_seed_statistics`, and `training_metadata`. `descriptive_metrics` is the same pooled sample as the top-level metrics and additionally reports `episodes`; `per_seed_summaries` has exactly one entry per evaluation seed group; `cross_seed_statistics` holds the Student's t statistics over those seed groups (`sample_count` counts seeds, not episodes); `training_metadata` repeats the training/evaluation provenance for the model behind that row.
+
+**CSV schema.** One row per completed budget with columns `budget_timesteps`, `trained_timesteps`, `success_rate`, `collision_rate`, `timeout_rate`, `mean_reward`, `std_reward`, `mean_episode_length`, `training_time_seconds`, `model_path`, `training_seed`, `evaluation_seeds` (seeds joined with `;`), `evaluation_episodes`, and `deterministic`.
+
+**Partial failures.** If a budget fails, the run stops at that budget: JSON and CSV are still written with `status: "failed"`, `completed_budgets`, `failed_budget`, and `error`, and `adaptive-rl benchmark budgets` prints a partial-failure report and exits with status `1`. Model artifacts and metrics for budgets listed in `completed_budgets` remain on disk and valid; a failed budget is never serialized as a completed result.
+
+**Plotting.** Pass `--plot` to additionally render `learning_curve_budget.png`. Matplotlib is imported only when plotting is requested, comes from the optional `plot` extra (`python -m pip install -e ".[plot]"`, included in `[all]`), and generated figures are always closed after saving. `--plot-x-axis trained` (default) uses the timesteps PPO actually collected, while `--plot-x-axis requested` uses the requested budget; the axis label always states which one is plotted, and the two differ whenever a budget is not aligned to a rollout boundary. A plot failure cannot corrupt benchmark data: it is recorded in `plot.error`, the JSON is rewritten with that field, the CSV is unchanged, and the CLI exits with status `1` after reporting the completed benchmark.
+
+The built-in benchmark defaults are budgets `[5000, 10000, 25000, 50000]`, training seed `42`, evaluation seed groups `[42, 43, 44, 45, 46]`, and `20` episodes per seed. A `benchmark` section in the YAML supplies these values instead; explicit CLI options override the corresponding config values. Legacy `evaluation.eval_episodes` does not control the number of seed groups or the benchmark episode count. Thus, without overrides, the default evaluation runs five seed groups with twenty episodes each, not twenty seed groups with twenty episodes each.
+
+`budget_timesteps` records the requested budget, while `trained_timesteps` records the actual environment interactions reported by Stable-Baselines3. For example, budget `65` with PPO `n_steps: 64` trains to `128` steps because PPO collects complete rollouts. Compare results using `trained_timesteps` when budgets are not aligned to rollout sizes.
+
+`training_time_seconds` measures only the call to `PPOAlgorithm.train()` using a monotonic clock. It excludes environment/model setup, final model serialization, metadata writing, evaluation, JSON/CSV export, and plotting. Training metadata also retains the broader legacy `duration_seconds` lifecycle measure, which is not the benchmark training-time metric. Neither duration is hardware-independent.
+
+The named benchmark metrics (`success_rate`, `collision_rate`, `timeout_rate`, `mean_reward`, `std_reward`, and `mean_episode_length`) are pooled descriptive summaries over all evaluated episodes for a budget. Reward standard deviation is the sample standard deviation across pooled episode returns and is unavailable (`null` in JSON, blank in CSV) with fewer than two episodes. Success and collision rates use episodes that reported the corresponding outcome field; timeout rate is based only on Gymnasium's actual `truncated` signal. The JSON additionally retains per-seed summaries and cross-seed Student's t statistics from the reusable evaluator; these are distinct from the pooled metrics and are not estimates based on the pooled episode sample. Within-seed reward and episode-length standard deviations follow the evaluator's existing population-standard-deviation convention; cross-seed uncertainty is then calculated over those seed summaries using sample-standard-deviation and Student's t conventions.
+
+Interpret the curves jointly: rising success rate and mean reward with a falling collision or timeout rate suggest improvement; flat metrics may indicate a plateau. Treat these curves as empirical observations, not as a monotonicity guarantee: each budget is an independent training run, and sampling and optimization noise can make a larger budget score worse than a smaller one on some metrics. A timeout is counted only when Gymnasium returns `truncated=True`, not merely because an episode has a particular length. The same seed groups and settings make evaluation conditions comparable, but do not remove variation from training or guarantee bit-for-bit results across hardware, PyTorch versions, or CUDA kernels.
+
+For a CI-sized run, copy the experiment YAML and set PPO `n_steps: 64` and `batch_size: 32` in that copy. Then run a short evaluation:
+
+```bash
+cp configs/drone_ppo_demo.yaml /tmp/drone_ppo_ci.yaml
+# Edit /tmp/drone_ppo_ci.yaml: set n_steps to 64 and batch_size to 32.
+adaptive-rl benchmark budgets --config /tmp/drone_ppo_ci.yaml --budgets 64,128 --episodes 1
+```
+
+The committed demo config uses `n_steps: 1024`, so those tiny budgets would be rounded up to its rollout boundary; keep the shipped training hyperparameters unchanged and use the copied config only for this CI-sized run.
+
+---
+
+## 4. Multi-Seed Evaluation and Confidence Intervals
+
+Evaluation over several independent environment seeds helps show how policy performance varies with randomized starts and obstacles, instead of depending on one seed sequence. `--episodes` is the number of episodes run for each listed seed. Each requested seed owns a disjoint block of actual environment reset seeds (`seed * episodes_per_seed + episode_index`), avoiding overlap between adjacent requested seed groups; the requested seed and actual per-episode reset seed are both recorded. Duplicate requested seeds are rejected to avoid overweighting a repeated condition.
+
+Episode records expose both seed meanings under explicit names: `evaluation_group_seed` is the requested evaluation seed (the statistical grouping unit) and `episode_reset_seed` is the per-episode environment reset seed. The legacy field names keep their documented meanings — `seed` equals `evaluation_group_seed` and `episode_seed` equals `episode_reset_seed`. Per-seed summaries expose `evaluation_group_seed` alongside `seed`, and report metadata carries `evaluation_group_seeds` plus a `seed_semantics` string.
+
+```bash
+adaptive-rl evaluate \
+  --config configs/drone_ppo.yaml \
+  --model artifacts/models/drone_ppo_final.zip \
+  --seeds 0 1 2 3 4 \
+  --episodes 10 \
+  --deterministic
+```
+
+The existing invocation remains single-seed and uses the configuration seed unless overridden with `--seed`:
+
+```bash
+adaptive-rl evaluate --config configs/drone_ppo.yaml --episodes 10
+adaptive-rl evaluate --config configs/drone_ppo.yaml --seed 7 --episodes 10
+```
+
+`--seed` and `--seeds` are mutually exclusive. In multi-seed mode, `--episodes` is per seed, and `--compare-random` is not supported. The command writes `artifacts/evaluation_multiseed.json` and `artifacts/evaluation_multiseed.csv` by default; `--output-report` and `--output-csv` can select alternate destinations.
+
+The JSON retains raw episode records (requested seed, episode index, actual reset seed, return, episode length, outcomes, truncation, and path length when the environment reports positions), per-seed summaries, aggregate metrics, and evaluation metadata. Optional geometry metrics follow an explicit availability contract: `path_length` is unavailable (`null`, and omitted from episode records) when the environment reports no positions, and obstacle surface clearance plus obstacle-vs-boundary collision typing are available only when the environment exposes obstacle geometry — read from the public `unwrapped.obstacles` interface when present, falling back to the private `_obstacles` attribute. The CSV is a stable, aggregate-only table with one row per metric and columns `metric`, `mean`, `std`, `ci95_lower`, `ci95_upper`, `sample_count`, `seed_count`, `episodes_per_seed`, and `total_episodes`.
+
+Cross-seed means and confidence intervals are calculated from the per-seed summaries, not pooled episodes. The standard deviation is the sample standard deviation (`ddof=1`); two-sided 95% confidence intervals use Student's t critical values and `mean ± t * s / sqrt(n)`. Missing values are excluded per metric. With fewer than two valid seeds, sample standard deviation and CI bounds are `null`/unavailable; they are not replaced with zero. The interval describes uncertainty in the estimated mean across the evaluated seeds under the independent, representative-seed and approximate t-model assumptions. It is not proof that one policy is superior. Identical seeds and deterministic actions reproduce equivalent episode results when the policy and environment implementation are unchanged.
+
+---
+
+## 5. Expected Results (Hypothesized Prior to Testing)
 
 1. **Random Action Baseline**:
    - Success Rate: $0.0\%$ (probability of randomly stumbling into a $1.5\text{ m}$ sphere across a $13,500\text{ m}^3$ arena without striking walls is practically zero).
@@ -50,7 +164,7 @@ This document details the experimental methodology, hypotheses, benchmark variab
 
 ---
 
-## 4. Actual Measured Results (Empirical Verification)
+## 6. Actual Measured Results (Empirical Verification)
 
 All results below were generated through genuine Python 3.12 CPU execution using the canonical project commands:
 ```bash
@@ -117,7 +231,7 @@ The generalization benchmark runs the frozen policy on both distributions ($N=20
 
 ---
 
-## 5. Reproducibility Guarantee
+## 7. Reproducibility Guarantee
 
 To independently reproduce the benchmark and empirical results:
 ```bash

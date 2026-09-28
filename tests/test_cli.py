@@ -1,10 +1,12 @@
 """Tests verifying Typer CLI commands and execution."""
 
+import json
 import re
 from pathlib import Path
 
 from typer.testing import CliRunner
 
+from adaptive_rl.algorithms.ppo import PPOAlgorithm
 from adaptive_rl.cli import app
 
 runner = CliRunner()
@@ -17,6 +19,7 @@ def test_cli_help() -> None:
     assert "AdaptiveRL" in result.output
     assert "train" in result.output
     assert "evaluate" in result.output
+    assert "benchmark" in result.output
     assert "demo-drone" in result.output
     assert "gui" in result.output
     assert "experiment-density" in result.output
@@ -95,6 +98,130 @@ def test_cli_env_inspect_failure() -> None:
     result = runner.invoke(app, ["env", "inspect", "NonExistentEnv-v999"])
     assert result.exit_code == 1
     assert "Environment inspection failed" in result.output
+
+
+def test_cli_multi_seed_evaluation_and_single_seed_compatibility(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class ZeroPolicy:
+        def predict(self, observation, deterministic=True):
+            import numpy as np
+
+            return np.zeros(3, dtype=np.float32), None
+
+    monkeypatch.setattr(
+        PPOAlgorithm,
+        "from_pretrained",
+        classmethod(lambda cls, path, env=None: ZeroPolicy()),
+    )
+    config_path = tmp_path / "evaluation.yaml"
+    config_path.write_text(
+        f"""
+name: cli_evaluation
+seed: 42
+algorithm:
+  name: ppo
+environment:
+  name: drone
+  max_steps: 2
+  parameters:
+    bounds: [20.0, 20.0, 10.0]
+    num_obstacles: 0
+training:
+  total_timesteps: 64
+evaluation:
+  eval_episodes: 2
+output_dir: "{tmp_path / "artifacts"}"
+log_dir: "{tmp_path / "logs"}"
+""",
+        encoding="utf-8",
+    )
+    model_path = tmp_path / "policy.zip"
+    model_path.touch()
+
+    multi_json = tmp_path / "multi.json"
+    multi_csv = tmp_path / "multi.csv"
+    multi = runner.invoke(
+        app,
+        [
+            "evaluate",
+            "--config",
+            str(config_path),
+            "--model",
+            str(model_path),
+            "--seeds",
+            "0",
+            "1",
+            "--episodes",
+            "1",
+            "--output-report",
+            str(multi_json),
+            "--output-csv",
+            str(multi_csv),
+        ],
+    )
+    assert multi.exit_code == 0, multi.output
+    assert "Multi-Seed Evaluation" in multi.output
+    assert "95% CI lower" in multi.output
+    assert "Seeds: 2" in multi.output
+    assert "Total episodes: 2" in multi.output
+    assert multi_json.is_file()
+    assert multi_csv.is_file()
+    assert json.loads(multi_json.read_text(encoding="utf-8"))["metadata"]["seeds"] == [0, 1]
+
+    single = runner.invoke(
+        app,
+        [
+            "evaluate",
+            "--config",
+            str(config_path),
+            "--model",
+            str(model_path),
+            "--seed",
+            "9",
+            "--episodes",
+            "1",
+            "--output-report",
+            str(tmp_path / "single.json"),
+        ],
+    )
+    assert single.exit_code == 0, single.output
+    assert "## Evaluation" in single.output
+    assert "Report saved to" in single.output
+
+    conflict = runner.invoke(
+        app,
+        [
+            "evaluate",
+            "--config",
+            str(config_path),
+            "--model",
+            str(model_path),
+            "--seed",
+            "9",
+            "--seeds",
+            "9",
+            "10",
+        ],
+    )
+    assert conflict.exit_code == 1
+    assert "Use either --seed or --seeds" in conflict.output
+
+    duplicate_seeds = runner.invoke(
+        app,
+        [
+            "evaluate",
+            "--config",
+            str(config_path),
+            "--model",
+            str(model_path),
+            "--seeds",
+            "2",
+            "2",
+        ],
+    )
+    assert duplicate_seeds.exit_code == 1
+    assert "seeds must be unique" in duplicate_seeds.output
 
 
 def test_cli_train_and_evaluate_and_demo(tmp_path: Path) -> None:

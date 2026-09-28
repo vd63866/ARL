@@ -12,7 +12,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 
 class ConfigError(Exception):
@@ -92,6 +100,72 @@ class EvaluationConfig(BaseModel):
         return data
 
 
+class BenchmarkConfig(BaseModel):
+    """Configuration for PPO learning-curve benchmarking across training budgets."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    budgets: list[StrictInt] = Field(
+        default_factory=lambda: [5000, 10000, 25000, 50000],
+        min_length=1,
+        description="Training budgets used for the learning-curve benchmark.",
+    )
+    training_seed: int = Field(42, ge=0, description="Seed used for all benchmark training runs")
+    evaluation_seeds: list[StrictInt] = Field(
+        default_factory=lambda: [42, 43, 44, 45, 46],
+        min_length=1,
+        description="Fixed seed sequence used for evaluation across all budgets.",
+    )
+    evaluation_episodes: int = Field(
+        20, gt=0, description="Episodes per seed for benchmark evaluation"
+    )
+    deterministic: bool = Field(
+        True,
+        description="Whether to evaluate using deterministic action selection for all budgets.",
+    )
+
+    @field_validator("budgets")
+    @classmethod
+    def _validate_budgets(cls, values: list[int]) -> list[int]:
+        if any(value <= 0 for value in values):
+            raise ValueError("Benchmark budgets must all be positive integers.")
+        if len(values) != len(set(values)):
+            raise ValueError("Benchmark budgets must not contain duplicates.")
+        return sorted(values)
+
+    @field_validator("evaluation_seeds")
+    @classmethod
+    def _validate_evaluation_seeds(cls, values: list[int]) -> list[int]:
+        if any(value < 0 for value in values):
+            raise ValueError("Evaluation seeds must be non-negative integers.")
+        if len(values) != len(set(values)):
+            raise ValueError("Evaluation seeds must not contain duplicates.")
+        return values
+
+
+class AdaptationBenchmarkConfig(BaseModel):
+    """Frozen TEST-B cell declaration for Issue #265."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    protocol_version: str = "2.0"
+    scenario: str = "TEST-B"
+    shift_parameters: Dict[str, Any] = Field(
+        default_factory=lambda: {"num_obstacles": 12, "wind_speed": 4.0, "gust_sigma": 0.6}
+    )
+
+    @model_validator(mode="after")
+    def _validate_test_b(self) -> "AdaptationBenchmarkConfig":
+        expected = {"num_obstacles": 12, "wind_speed": 4.0, "gust_sigma": 0.6}
+        if self.protocol_version != "2.0":
+            raise ValueError("Issue #265 requires protocol_version '2.0'")
+        if self.scenario != "TEST-B" or self.shift_parameters != expected:
+            raise ValueError(
+                "Issue #265's primary cell is exactly TEST-B (12 obstacles, wind 4.0, gust 0.6)"
+            )
+        return self
+
+
 class ExperimentConfig(BaseModel):
     """Top-level configuration schema for an AdaptiveRL experiment."""
 
@@ -110,6 +184,14 @@ class ExperimentConfig(BaseModel):
     log_dir: Path = Field(
         default_factory=lambda: Path("artifacts/logs"),
         description="Directory for logging and metrics",
+    )
+    benchmark: Optional[BenchmarkConfig] = Field(
+        default=None,
+        description="Optional benchmark settings for training-budget learning curves.",
+    )
+    adaptation_benchmark: Optional[AdaptationBenchmarkConfig] = Field(
+        default=None,
+        description="Frozen Issue #265 TEST-B online-adaptation cell.",
     )
 
     @model_validator(mode="before")

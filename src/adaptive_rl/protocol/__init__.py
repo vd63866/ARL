@@ -9,6 +9,15 @@ implement the future Adaptive treatment harness, do not modify
 ``shift_runner.py``, and do not make any experimental cell executable.
 """
 
+from adaptive_rl.protocol.adaptation import (
+    AdaptationAdapter,
+    PostShiftEpisode,
+    Transition,
+    UpdateBatch,
+    build_update_batch,
+    call_update_atomically,
+    validate_block_sequence,
+)
 from adaptive_rl.protocol.constants import (
     ALPHA,
     BOOTSTRAP_REPS,
@@ -74,6 +83,7 @@ from adaptive_rl.protocol.statistics import (
 )
 
 __all__ = [
+    "AdaptationAdapter",
     "ALPHA",
     "BOOTSTRAP_REPS",
     "BOOTSTRAP_SEED",
@@ -95,6 +105,7 @@ __all__ = [
     "PROTOCOL_VERSION",
     "PairedTTest",
     "PERSISTENCE",
+    "PostShiftEpisode",
     "RECOVERY_STATUSES",
     "RECOVERY_THRESHOLD",
     "RecoveryResult",
@@ -105,10 +116,14 @@ __all__ = [
     "STATUS_RIGHT_CENSORED",
     "SignTestResult",
     "TRAINING_SEEDS",
+    "Transition",
+    "UpdateBatch",
     "WINDOW",
     "WilcoxonResult",
     "bootstrap_percentile_ci",
     "build_schedule",
+    "build_update_batch",
+    "call_update_atomically",
     "cohen_dz",
     "compute_recovery",
     "decide_family",
@@ -128,5 +143,6 @@ __all__ = [
     "student_t_cdf",
     "student_t_ppf",
     "trailing_window_means",
+    "validate_block_sequence",
     "validate_schedule",
 ]

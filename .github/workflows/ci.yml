@@ -69,6 +69,7 @@ jobs:
   smoke-test:
     name: End-to-End Pipeline Smoke Test
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -82,9 +83,9 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[rl,gui]"
+          pip install -e ".[rl,gui,dev]"
 
-      - name: Verify CLI and environment inspection
+      - name: Verify CLI entry points
         run: |
           adaptive-rl --help
           adaptive-rl version
@@ -92,14 +93,8 @@ jobs:
           adaptive-rl config validate configs/drone_ppo_demo.yaml
           adaptive-rl gui --help
 
-      - name: Run quick training smoke test
+      # Trains on configs/ci_smoke.yaml (512 steps), then verifies checkpoints, reload,
+      # evaluation.json schema and deterministic demo. Failures name the broken stage.
+      - name: Run end-to-end pipeline smoke test
         run: |
-          adaptive-rl train --config configs/drone_ppo_demo.yaml
-
-      - name: Run evaluation smoke test
-        run: |
-          adaptive-rl evaluate --config configs/drone_ppo_demo.yaml --model artifacts/models/drone_ppo_demo_final.zip --episodes 5
-
-      - name: Run demo execution
-        run: |
-          adaptive-rl demo-drone --model artifacts/models/drone_ppo_demo_final.zip --seed 42
+          pytest -v tests/test_e2e_smoke.py

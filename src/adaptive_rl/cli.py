@@ -8,7 +8,7 @@ a target, evaluate the trained agent, and visualize the flight demonstration.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Literal, Optional, cast
 
 import typer
 from rich.console import Console
@@ -26,6 +26,13 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 
+benchmark_app = typer.Typer(
+    name="benchmark",
+    help="Benchmark commands for learning curves and online adaptation.",
+    no_args_is_help=True,
+)
+app.add_typer(benchmark_app, name="benchmark")
+
 config_app = typer.Typer(
     name="config",
     help="Configuration inspection and validation commands.",
@@ -41,6 +48,10 @@ env_app = typer.Typer(
 app.add_typer(env_app, name="env")
 
 console = Console()
+
+
+def _format_metric(value: float | None) -> str:
+    return f"{value:.3f}" if value is not None else "N/A"
 
 
 @app.command()
@@ -222,36 +233,39 @@ def train(
         raise typer.Exit(code=1)
 
 
-@app.command()
-def evaluate(
+@benchmark_app.command(name="budgets")
+def benchmark_budgets(
     config: Optional[Path] = typer.Option(
         None, "--config", "-c", help="Path to experiment configuration YAML"
     ),
-    model: Optional[Path] = typer.Option(
-        None, "--model", "-m", help="Path to trained model weights (.zip)"
+    budgets: Optional[str] = typer.Option(
+        None, "--budgets", help="Comma-separated training budgets (for example: 5000,10000,25000)"
+    ),
+    training_seed: Optional[int] = typer.Option(
+        None, "--training-seed", help="Override the training seed used across budgets"
+    ),
+    eval_seeds: Optional[str] = typer.Option(
+        None,
+        "--eval-seeds",
+        help="Comma-separated evaluation seed groups; defaults to configured or benchmark seeds",
     ),
     episodes: Optional[int] = typer.Option(
-        20, "--episodes", "-e", help="Number of evaluation episodes"
+        None, "--episodes", help="Evaluation episodes per seed (separate from the seed count)"
     ),
-    deterministic: bool = typer.Option(
-        True, "--deterministic/--stochastic", help="Use deterministic action selection"
+    deterministic: Optional[bool] = typer.Option(
+        None, "--deterministic/--stochastic", help="Use deterministic actions during evaluation"
     ),
-    output_report: Optional[Path] = typer.Option(
-        None, "--output-report", "-o", help="Optional path to export JSON metrics report"
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", help="Directory for benchmark JSON/CSV/plot artifacts"
     ),
-    output_csv: Optional[Path] = typer.Option(
-        None, "--output-csv", help="Optional path to export CSV metrics report"
-    ),
-    compare_random: bool = typer.Option(
-        False,
-        "--compare-random",
-        help="Compare PPO against random action baseline under identical conditions",
-    ),
-    split: Optional[str] = typer.Option(
-        None, "--split", help="Environment dataset split ('train' or 'test')"
+    plot: bool = typer.Option(False, "--plot/--no-plot", help="Render a learning-curve plot"),
+    plot_x_axis: str = typer.Option(
+        "trained",
+        "--plot-x-axis",
+        help="Plot x-axis semantics: 'trained' (actual timesteps) or 'requested' (budget)",
     ),
 ) -> None:
-    """Evaluate a trained agent over multiple benchmark episodes."""
+    """Run the PPO learning-curve benchmark across training budgets (PPO only)."""
     if config is None:
         for candidate in [Path("configs/drone_ppo.yaml"), Path("configs/drone_ppo_demo.yaml")]:
             if candidate.exists():
@@ -269,7 +283,291 @@ def evaluate(
         console.print(f"[bold red]Configuration error:[/bold red] {err}")
         raise typer.Exit(code=1)
 
-    clean_split: Optional[str] = None
+    x_axis = plot_x_axis.strip().lower()
+    if x_axis not in ("trained", "requested"):
+        console.print(
+            f"[bold red]Invalid --plot-x-axis:[/bold red] {plot_x_axis!r}. "
+            "Expected 'trained' or 'requested'."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        from adaptive_rl.benchmarking import (
+            BenchmarkRunError,
+            run_learning_curve_benchmark,
+            validate_budgets,
+        )
+    except ImportError as err:
+        console.print(f"[bold red]Benchmarking module unavailable:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    try:
+        budget_values = validate_budgets(budgets) if budgets is not None else None
+        if eval_seeds is not None:
+            seed_tokens = [part.strip() for part in eval_seeds.split(",")]
+            if not seed_tokens or any(not token for token in seed_tokens):
+                raise ValueError(
+                    "Malformed evaluation seed list: expected comma-separated integers."
+                )
+            parsed_eval_seeds = []
+            for token in seed_tokens:
+                try:
+                    parsed_eval_seeds.append(int(token))
+                except ValueError as err:
+                    raise ValueError(f"Malformed evaluation seed value: {token!r}") from err
+        else:
+            parsed_eval_seeds = None
+
+        result = run_learning_curve_benchmark(
+            exp_config,
+            budgets=budget_values,
+            training_seed=training_seed,
+            evaluation_seeds=parsed_eval_seeds,
+            evaluation_episodes=episodes,
+            deterministic=deterministic,
+            output_dir=output_dir,
+            plot=plot,
+            plot_x_axis=cast(Literal["trained", "requested"], x_axis),
+        )
+    except BenchmarkRunError as err:
+        partial = err.result
+        completed = ", ".join(str(b) for b in partial.completed_budgets) or "none"
+        console.print(
+            Panel.fit(
+                f"[bold red]PPO learning-curve benchmark FAILED[/bold red]\n\n"
+                f"• [bold]Status:[/bold] {partial.status}\n"
+                f"• [bold]Completed budgets:[/bold] {completed}\n"
+                f"• [bold]Failed budget:[/bold] {partial.failed_budget}\n"
+                f"• [bold]Error:[/bold] {partial.error}\n"
+                f"• [bold]JSON:[/bold] {partial.json_path}\n"
+                f"• [bold]CSV:[/bold] {partial.csv_path}",
+                title="Learning Curve Benchmark (partial)",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(code=1)
+    except Exception as err:
+        console.print(f"[bold red]Benchmark failed with error:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    if result.plot_path is None:
+        plot_summary = "not requested"
+    elif result.plot_error is not None:
+        plot_summary = f"FAILED ({result.plot_error})"
+    else:
+        plot_summary = str(result.plot_path)
+
+    console.print(
+        Panel.fit(
+            f"[bold green]PPO learning-curve benchmark complete[/bold green]\n\n"
+            f"• [bold]Status:[/bold] {result.status}\n"
+            f"• [bold]Budgets:[/bold] {', '.join(str(b) for b in result.budgets)}\n"
+            f"• [bold]Completed budgets:[/bold] "
+            f"{', '.join(str(b) for b in result.completed_budgets)}\n"
+            f"• [bold]Training seed:[/bold] {result.training_seed}\n"
+            f"• [bold]Evaluation seeds:[/bold] {result.evaluation_seeds}\n"
+            f"• [bold]Episodes per seed:[/bold] {result.evaluation_episodes}\n"
+            f"• [bold]JSON:[/bold] {result.json_path}\n"
+            f"• [bold]CSV:[/bold] {result.csv_path}\n"
+            f"• [bold]Plot:[/bold] {plot_summary}",
+            title="Learning Curve Benchmark",
+            border_style="green",
+        )
+    )
+    if result.plot_error is not None:
+        console.print(
+            "[bold red]Plot generation failed; JSON/CSV artifacts were preserved.[/bold red]"
+        )
+        raise typer.Exit(code=1)
+
+
+@benchmark_app.command(name="adaptation")
+def benchmark_adaptation(
+    config: Path = typer.Option(
+        Path("configs/drone_distribution_shift.yaml"),
+        "--config",
+        "-c",
+        help="Issue #265 nominal training and TEST-B configuration",
+    ),
+    algorithm: Optional[str] = typer.Option(
+        None, "--algorithm", help="Algorithm cell: ppo or sac (defaults to config value)"
+    ),
+    training_seeds: Optional[str] = typer.Option(
+        None,
+        "--training-seeds",
+        help="Comma-separated preregistered training seeds; defaults to all ten",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None, "--output-dir", help="Directory for Issue #265 JSON/CSV and training artifacts"
+    ),
+    deterministic: Optional[bool] = typer.Option(
+        None, "--deterministic/--stochastic", help="Override action selection for all evaluations"
+    ),
+    smoke: bool = typer.Option(
+        False,
+        "--smoke",
+        help="Run one explicitly labeled, reduced-size machinery check (not research data)",
+    ),
+) -> None:
+    """Run the preregistered train-once, forked Adaptive-vs-Fixed experiment."""
+    try:
+        exp_config = load_config(config)
+        if algorithm is not None:
+            selected_algorithm = algorithm.strip().lower()
+            if selected_algorithm not in {"ppo", "sac"}:
+                raise ValueError("--algorithm must be 'ppo' or 'sac'")
+            algorithm_config = exp_config.algorithm.model_copy(deep=True)
+            if selected_algorithm != algorithm_config.name.strip().lower():
+                algorithm_config.name = selected_algorithm
+                if selected_algorithm == "sac":
+                    algorithm_config.parameters = {
+                        "buffer_size": 100_000,
+                        "learning_starts": 100,
+                        "train_freq": 1,
+                        "gradient_steps": 1,
+                        "tau": 0.005,
+                        "ent_coef": "auto",
+                    }
+                else:
+                    algorithm_config.parameters = {
+                        "n_steps": 1024,
+                        "n_epochs": 10,
+                        "clip_range": 0.2,
+                        "ent_coef": 0.01,
+                    }
+                exp_config = exp_config.model_copy(
+                    update={"algorithm": algorithm_config}, deep=True
+                )
+        if deterministic is not None:
+            evaluation_config = exp_config.evaluation.model_copy(deep=True)
+            evaluation_config.deterministic = deterministic
+            exp_config = exp_config.model_copy(update={"evaluation": evaluation_config}, deep=True)
+
+        selected_seeds = None
+        if training_seeds is not None:
+            tokens = [token.strip() for token in training_seeds.split(",")]
+            if not tokens or any(not token for token in tokens):
+                raise ValueError("--training-seeds expects comma-separated integers")
+            try:
+                selected_seeds = [int(token) for token in tokens]
+            except ValueError as exc:
+                raise ValueError("--training-seeds expects comma-separated integers") from exc
+
+        from adaptive_rl.benchmarking.adaptation_runner import run_adaptation_benchmark
+
+        artifact = run_adaptation_benchmark(
+            exp_config,
+            output_dir=output_dir,
+            training_seeds=selected_seeds,
+            smoke=smoke,
+            config_path=config,
+        )
+    except Exception as err:
+        console.print(f"[bold red]Issue #265 benchmark failed:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    failed = artifact["failure_summary"]["failed_replicates"]
+    completed = artifact["failure_summary"]["completed_replicates"]
+    console.print(
+        Panel.fit(
+            f"[bold]{'Smoke check' if smoke else 'Issue #265 benchmark'} finished[/bold]\n\n"
+            f"• [bold]Run type:[/bold] {artifact['run_type']}\n"
+            f"• [bold]Algorithm:[/bold] {artifact['experiment']['algorithm']}\n"
+            f"• [bold]Completed replicates:[/bold] {completed}\n"
+            f"• [bold]Failed replicates:[/bold] {len(failed)}\n"
+            f"• [bold]JSON:[/bold] {Path(output_dir or exp_config.output_dir) / 'adaptation.json'}\n"
+            f"• [bold]CSV:[/bold] {Path(output_dir or exp_config.output_dir) / 'adaptation.csv'}\n"
+            f"• [bold]Scientific result:[/bold] not established by harness execution",
+            title="Online Adaptation Benchmark",
+            border_style="yellow" if smoke or failed else "green",
+        )
+    )
+    if failed:
+        raise typer.Exit(code=1)
+
+
+@app.command(context_settings={"allow_extra_args": True})
+def evaluate(
+    ctx: typer.Context,
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c", help="Path to experiment configuration YAML"
+    ),
+    model: Optional[Path] = typer.Option(
+        None, "--model", "-m", help="Path to trained model weights (.zip)"
+    ),
+    episodes: Optional[int] = typer.Option(
+        20, "--episodes", "-e", help="Number of evaluation episodes"
+    ),
+    seed: Optional[int] = typer.Option(
+        None, "--seed", "-s", help="Base seed for single-seed evaluation (defaults to config seed)"
+    ),
+    seeds: Optional[List[int]] = typer.Option(
+        None, "--seeds", help="Explicit evaluation seeds; each seed runs --episodes episodes"
+    ),
+    deterministic: bool = typer.Option(
+        True, "--deterministic/--stochastic", help="Use deterministic action selection"
+    ),
+    output_report: Optional[Path] = typer.Option(
+        None, "--output-report", "-o", help="Optional path to export JSON metrics report"
+    ),
+    output_csv: Optional[Path] = typer.Option(
+        None, "--output-csv", help="Optional path to export aggregated multi-seed CSV"
+    ),
+    compare_random: bool = typer.Option(
+        False,
+        "--compare-random",
+        help="Compare PPO against random action baseline under identical conditions",
+    ),
+    split: Optional[str] = typer.Option(
+        None, "--split", help="Environment dataset split ('train' or 'test')"
+    ),
+) -> None:
+    """Evaluate a trained agent over multiple benchmark episodes."""
+    if ctx.args:
+        if seeds is None:
+            console.print(
+                "[bold red]Unexpected positional values; provide seeds with --seeds.[/bold red]"
+            )
+            raise typer.Exit(code=1)
+        try:
+            seeds.extend(int(value) for value in ctx.args)
+        except ValueError:
+            console.print(
+                "[bold red]Seeds must be integers; use --seeds followed by space-separated values.[/bold red]"
+            )
+            raise typer.Exit(code=1)
+
+    if config is None:
+        for candidate in [Path("configs/drone_ppo.yaml"), Path("configs/drone_ppo_demo.yaml")]:
+            if candidate.exists():
+                config = candidate
+                break
+        if config is None:
+            console.print(
+                "[bold red]No configuration file provided.[/bold red] Specify --config <path>"
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        exp_config = load_config(config)
+    except ConfigError as err:
+        console.print(f"[bold red]Configuration error:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    num_episodes = episodes if episodes is not None else exp_config.evaluation.eval_episodes
+    if num_episodes <= 0:
+        console.print("[bold red]Evaluation episodes must be positive.[/bold red]")
+        raise typer.Exit(code=1)
+    if seed is not None and seed < 0:
+        console.print("[bold red]Evaluation seed must be non-negative.[/bold red]")
+        raise typer.Exit(code=1)
+    if seeds is not None and seed is not None:
+        console.print("[bold red]Use either --seed or --seeds, not both.[/bold red]")
+        raise typer.Exit(code=1)
+    if seeds is not None and compare_random:
+        console.print("[bold red]--compare-random cannot be combined with --seeds.[/bold red]")
+        raise typer.Exit(code=1)
+
     if split is not None:
         clean_split = split.strip().lower()
         if clean_split not in ("train", "test"):
@@ -277,9 +575,12 @@ def evaluate(
                 f"[bold red]Invalid split:[/bold red] '{split}'. Expected 'train' or 'test'."
             )
             raise typer.Exit(code=1)
+        if seeds is not None:
+            console.print("[bold red]--split cannot be combined with --seeds.[/bold red]")
+            raise typer.Exit(code=1)
         exp_config.environment.parameters["split"] = clean_split
-
-    num_episodes = episodes or exp_config.evaluation.eval_episodes
+    else:
+        clean_split = None
 
     # Resolve model path
     if model is None:
@@ -299,7 +600,8 @@ def evaluate(
             f"• [bold]Model:[/bold] {model}\n"
             f"• [bold]Environment:[/bold] {exp_config.environment.name}\n"
             f"• [bold]Episodes:[/bold] {num_episodes}\n"
-            f"• [bold]Deterministic:[/bold] {deterministic}"
+            f"• [bold]Deterministic:[/bold] {deterministic}\n"
+            f"• [bold]Seeds:[/bold] {seeds if seeds is not None else seed if seed is not None else exp_config.seed}"
             f"{split_info}",
             title="Evaluation Engine",
             border_style="cyan",
@@ -317,89 +619,133 @@ def evaluate(
         algo = PPOAlgorithm.from_pretrained(model, env=env)
         evaluator = Evaluator(algorithm=algo, env=env)
 
-        metrics = evaluator.evaluate(
-            num_episodes=num_episodes,
-            deterministic=deterministic,
-            base_seed=exp_config.seed if clean_split is None else None,
-            split=clean_split,
-        )
-
-        success_pct = (
-            f"{metrics.success_rate * 100:.1f}%" if metrics.success_rate is not None else "N/A"
-        )
-        collision_pct = (
-            f"{metrics.collision_rate * 100:.1f}%" if metrics.collision_rate is not None else "N/A"
-        )
-
-        console.print("\n[bold]## Evaluation[/bold]")
-        console.print(f"Episodes: {metrics.episodes}")
-        console.print(f"Success rate: {success_pct}")
-        console.print(f"Collision rate: {collision_pct}")
-        console.print(f"Mean reward: {metrics.mean_reward:.2f}")
-        console.print(f"Mean episode length: {metrics.mean_episode_length:.1f}\n")
-
-        table = Table(title=f"Benchmark Results ({num_episodes} episodes)")
-        table.add_column("Metric", style="cyan")
-        table.add_column("Value", style="green", justify="right")
-
-        table.add_row("Mean Reward", f"{metrics.mean_reward:.2f} ± {metrics.std_reward:.2f}")
-        table.add_row("Min / Max Reward", f"{metrics.min_reward:.2f} / {metrics.max_reward:.2f}")
-        table.add_row("Success Rate", success_pct)
-        table.add_row("Collision Rate", collision_pct)
-        if (
-            metrics.obstacle_collision_count is not None
-            and metrics.boundary_collision_count is not None
-        ):
-            table.add_row(
-                "  • Obstacle Collisions",
-                f"{metrics.obstacle_collision_count} ({(metrics.obstacle_collision_rate or 0.0) * 100:.1f}%)",
+        metrics = None
+        if seeds is not None:
+            multi_seed_result = evaluator.evaluate_seeds(
+                seeds=seeds,
+                episodes_per_seed=num_episodes,
+                deterministic=deterministic,
             )
-            table.add_row(
-                "  • Boundary Collisions",
-                f"{metrics.boundary_collision_count} ({(metrics.boundary_collision_rate or 0.0) * 100:.1f}%)",
+            console.print(
+                f"\nSeeds: {len(multi_seed_result.seeds)} | "
+                f"Episodes per seed: {multi_seed_result.episodes_per_seed} | "
+                f"Total episodes: {multi_seed_result.total_episodes}"
             )
-        table.add_row(
-            "Mean Episode Length",
-            f"{metrics.mean_episode_length:.1f} ± {metrics.std_episode_length:.1f}",
-        )
-        if metrics.mean_path_length is not None:
-            table.add_row(
-                "Mean Path Length",
-                f"{metrics.mean_path_length:.2f} ± {metrics.std_path_length or 0.0:.2f} m",
+            table = Table(title="Multi-Seed Evaluation (95% Student's t CI)")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Mean", justify="right")
+            table.add_column("Std", justify="right")
+            table.add_column("95% CI lower", justify="right")
+            table.add_column("95% CI upper", justify="right")
+            for metric_name, label in (
+                ("mean_reward", "Mean reward"),
+                ("success_rate", "Success rate"),
+                ("collision_rate", "Collision rate"),
+                ("mean_episode_length", "Episode length"),
+            ):
+                summary = multi_seed_result.aggregate[metric_name]
+                table.add_row(
+                    label,
+                    _format_metric(summary.mean),
+                    _format_metric(summary.std),
+                    _format_metric(summary.ci95_lower),
+                    _format_metric(summary.ci95_upper),
+                )
+            console.print(table)
+            report_target = output_report or (exp_config.output_dir / "evaluation_multiseed.json")
+            csv_target = output_csv or (exp_config.output_dir / "evaluation_multiseed.csv")
+            json_saved, csv_saved = evaluator.save_multiseed_report(
+                multi_seed_result, report_target, csv_target
             )
-        if metrics.mean_straight_line_distance is not None:
-            table.add_row(
-                "Straight-Line Distance",
-                f"{metrics.mean_straight_line_distance:.2f} m",
+            console.print(f"\n[bold green]JSON report saved to:[/bold green] {json_saved}")
+            console.print(f"[bold green]CSV report saved to:[/bold green] {csv_saved}")
+        else:
+            metrics = evaluator.evaluate(
+                num_episodes=num_episodes,
+                deterministic=deterministic,
+                base_seed=(exp_config.seed if seed is None else seed)
+                if clean_split is None
+                else None,
+                split=clean_split,
             )
-        if metrics.mean_path_efficiency is not None:
-            table.add_row(
-                "Path Efficiency",
-                f"{metrics.mean_path_efficiency * 100:.1f}%",
-            )
-        if metrics.mean_min_obstacle_clearance is not None:
-            import math
 
-            clearance_str = (
-                f"{metrics.mean_min_obstacle_clearance:.2f} m"
-                if math.isfinite(metrics.mean_min_obstacle_clearance)
+            success_pct = (
+                f"{metrics.success_rate * 100:.1f}%" if metrics.success_rate is not None else "N/A"
+            )
+            collision_pct = (
+                f"{metrics.collision_rate * 100:.1f}%"
+                if metrics.collision_rate is not None
                 else "N/A"
             )
-            table.add_row("Min Obstacle Clearance", clearance_str)
-        if metrics.mean_max_velocity is not None:
-            table.add_row("Max Velocity", f"{metrics.mean_max_velocity:.2f} m/s")
-        if metrics.mean_max_acceleration is not None:
-            table.add_row("Max Acceleration", f"{metrics.mean_max_acceleration:.2f} m/s²")
-        console.print(table)
 
-        if compare_random:
+            console.print("\n[bold]## Evaluation[/bold]")
+            console.print(f"Episodes: {metrics.episodes}")
+            console.print(f"Success rate: {success_pct}")
+            console.print(f"Collision rate: {collision_pct}")
+            console.print(f"Mean reward: {metrics.mean_reward:.2f}")
+            console.print(f"Mean episode length: {metrics.mean_episode_length:.1f}\n")
+
+            table = Table(title=f"Benchmark Results ({num_episodes} episodes)")
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green", justify="right")
+            table.add_row("Mean Reward", f"{metrics.mean_reward:.2f} ± {metrics.std_reward:.2f}")
+            table.add_row(
+                "Min / Max Reward", f"{metrics.min_reward:.2f} / {metrics.max_reward:.2f}"
+            )
+            table.add_row("Success Rate", success_pct)
+            table.add_row("Collision Rate", collision_pct)
+            table.add_row(
+                "Mean Episode Length",
+                f"{metrics.mean_episode_length:.1f} ± {metrics.std_episode_length:.1f}",
+            )
+            if (
+                metrics.obstacle_collision_count is not None
+                and metrics.boundary_collision_count is not None
+            ):
+                table.add_row(
+                    "  • Obstacle Collisions",
+                    f"{metrics.obstacle_collision_count} ({(metrics.obstacle_collision_rate or 0.0) * 100:.1f}%)",
+                )
+                table.add_row(
+                    "  • Boundary Collisions",
+                    f"{metrics.boundary_collision_count} ({(metrics.boundary_collision_rate or 0.0) * 100:.1f}%)",
+                )
+            if metrics.mean_path_length is not None:
+                table.add_row(
+                    "Mean Path Length",
+                    f"{metrics.mean_path_length:.2f} ± {metrics.std_path_length or 0.0:.2f} m",
+                )
+            if metrics.mean_straight_line_distance is not None:
+                table.add_row(
+                    "Straight-Line Distance", f"{metrics.mean_straight_line_distance:.2f} m"
+                )
+            if metrics.mean_path_efficiency is not None:
+                table.add_row("Path Efficiency", f"{metrics.mean_path_efficiency * 100:.1f}%")
+            if metrics.mean_min_obstacle_clearance is not None:
+                import math
+
+                clearance_str = (
+                    f"{metrics.mean_min_obstacle_clearance:.2f} m"
+                    if math.isfinite(metrics.mean_min_obstacle_clearance)
+                    else "N/A"
+                )
+                table.add_row("Min Obstacle Clearance", clearance_str)
+            if metrics.mean_max_velocity is not None:
+                table.add_row("Max Velocity", f"{metrics.mean_max_velocity:.2f} m/s")
+            if metrics.mean_max_acceleration is not None:
+                table.add_row("Max Acceleration", f"{metrics.mean_max_acceleration:.2f} m/s²")
+            console.print(table)
+
+        if compare_random and metrics is not None:
             from adaptive_rl.evaluation.evaluator import compare_policies
 
             comp_results = compare_policies(
                 ppo_algorithm=algo,
                 env=env,
                 num_episodes=num_episodes,
-                base_seed=exp_config.seed if clean_split is None else None,
+                base_seed=(exp_config.seed if seed is None else seed)
+                if clean_split is None
+                else None,
                 split=clean_split,
             )
             comp_table = Table(title=f"Policy Comparison ({num_episodes} episodes)")
@@ -422,13 +768,14 @@ def evaluate(
             console.print("\n")
             console.print(comp_table)
 
-        report_target = output_report or (exp_config.output_dir / "evaluation.json")
-        saved_path = evaluator.save_report(metrics, report_target)
-        console.print(f"\n[bold green]Report saved to:[/bold green] {saved_path}")
+        if metrics is not None:
+            report_target = output_report or (exp_config.output_dir / "evaluation.json")
+            saved_path = evaluator.save_report(metrics, report_target)
+            console.print(f"\n[bold green]Report saved to:[/bold green] {saved_path}")
 
-        csv_target = output_csv or (exp_config.output_dir / "evaluation.csv")
-        saved_csv = evaluator.save_csv_report(metrics, csv_target)
-        console.print(f"[bold green]CSV report saved to:[/bold green] {saved_csv}")
+            csv_target = output_csv or (exp_config.output_dir / "evaluation.csv")
+            saved_csv = evaluator.save_csv_report(metrics, csv_target)
+            console.print(f"[bold green]CSV report saved to:[/bold green] {saved_csv}")
 
         env.close()
     except Exception as err:

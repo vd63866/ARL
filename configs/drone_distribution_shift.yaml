@@ -1,0 +1,50 @@
+# Issue #265: primary moderate TEST-B condition. Training receives only the
+# nominal environment.parameters block. shift_parameters are held back until
+# after training and the shared pre-shift evaluation.
+name: "drone_online_adaptation"
+seed: 31001
+
+algorithm:
+  name: "ppo"
+  learning_rate: 0.0003
+  gamma: 0.99
+  batch_size: 128
+  parameters:
+    n_steps: 1024
+    n_epochs: 10
+    clip_range: 0.2
+    ent_coef: 0.01
+
+environment:
+  name: "drone_disturbed"
+  max_steps: 300
+  parameters:
+    bounds: [50.0, 50.0, 25.0]
+    num_obstacles: 8
+    num_lidar_rays: 16
+    linear_damping: 0.05
+    max_acceleration: 4.0
+    wind_speed: 0.5
+    gust_sigma: 0.15
+    gust_theta: 0.15
+    wind_direction: [1.5, 0.5, 0.0]
+
+training:
+  total_timesteps: 60000
+  checkpoint_freq: 0
+  log_interval: 10
+
+evaluation:
+  eval_episodes: 15
+  deterministic: true
+
+adaptation_benchmark:
+  protocol_version: "2.0"
+  scenario: "TEST-B"
+  shift_parameters:
+    num_obstacles: 12
+    wind_speed: 4.0
+    gust_sigma: 0.6
+
+output_dir: "artifacts/adaptation"
+log_dir: "artifacts/adaptation/logs"

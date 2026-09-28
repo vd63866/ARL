@@ -130,7 +130,6 @@ class DroneKinematics3D:
         raw_acc = np.asarray(action_acceleration, dtype=np.float64)
         if raw_acc.shape != (3,):
             raise ValueError(f"Acceleration command must have shape (3,), got {raw_acc.shape}")
-
         clamped_acc = np.clip(raw_acc, -self.max_acceleration, self.max_acceleration)
         self.state.acceleration = clamped_acc
 
@@ -395,6 +394,10 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
         terminate_on_collision: bool = True,
         render_mode: Optional[str] = None,
         split: Optional[str] = None,
+        wind_speed: float = 0.0,
+        gust_sigma: float = 0.0,
+        gust_theta: float = 0.15,
+        wind_direction: Tuple[float, float, float] = (1.5, 0.5, 0.0),
     ) -> None:
         super().__init__()
         if any(b <= 0.0 for b in bounds):
@@ -405,6 +408,19 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
             raise ValueError(f"target_radius must be positive, got {target_radius}")
         if collision_radius <= 0.0:
             raise ValueError(f"collision_radius must be positive, got {collision_radius}")
+        if not np.isfinite(wind_speed) or wind_speed < 0.0:
+            raise ValueError(f"wind_speed must be finite and non-negative, got {wind_speed}")
+        if not np.isfinite(gust_sigma) or gust_sigma < 0.0:
+            raise ValueError(f"gust_sigma must be finite and non-negative, got {gust_sigma}")
+        if not np.isfinite(gust_theta) or gust_theta <= 0.0:
+            raise ValueError(f"gust_theta must be finite and positive, got {gust_theta}")
+        direction = np.asarray(wind_direction, dtype=np.float64)
+        if (
+            direction.shape != (3,)
+            or not np.isfinite(direction).all()
+            or np.linalg.norm(direction) == 0
+        ):
+            raise ValueError("wind_direction must be a finite, non-zero 3-vector")
 
         self.split: Optional[str] = None
         if split is not None:
@@ -447,6 +463,11 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
         self.action_penalty_weight = float(action_penalty_weight)
         self.terminate_on_collision = terminate_on_collision
         self.render_mode = render_mode
+        self.wind_speed = float(wind_speed)
+        self.gust_sigma = float(gust_sigma)
+        self.gust_theta = float(gust_theta)
+        self.wind_direction = direction / np.linalg.norm(direction)
+        self._gust_velocity = np.zeros(3, dtype=np.float64)
 
         self.max_diagonal = float(np.linalg.norm(self.bounds))
 
@@ -546,12 +567,34 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
             "num_obstacles": len(self._obstacles),
             "min_obstacle_distance": min_obs_dist if self._obstacles else float("inf"),
             "altitude": float(self._position[2]),
+            "wind_velocity": self._wind_velocity(self._position).copy(),
         }
         current_split = self._active_split if self._active_split is not None else self.split
         if current_split is not None:
             info["split"] = current_split
             info["split_seed"] = self._last_split_seed
         return info
+
+    def _wind_velocity(self, position: np.ndarray) -> np.ndarray:
+        altitude_factor = 1.0 + 0.02 * max(0.0, float(position[2]))
+        return self.wind_direction * self.wind_speed * altitude_factor + self._gust_velocity
+
+    def get_effective_parameters(self) -> Dict[str, Any]:
+        """Return the physical environment parameters used by this instance."""
+        return {
+            "bounds": list(self.bounds),
+            "num_obstacles": self.num_obstacles,
+            "obstacle_radius": self.obstacle_radius,
+            "wind_speed": self.wind_speed,
+            "gust_sigma": self.gust_sigma,
+            "gust_theta": self.gust_theta,
+            "wind_direction": self.wind_direction.tolist(),
+            "wind_altitude_shear": 0.02,
+            "max_gust": 4.0,
+            "linear_damping": self.kinematics.linear_damping,
+            "max_acceleration": self.kinematics.max_acceleration,
+            "max_steps": self.max_steps,
+        }
 
     @property
     def drone_state(self) -> DroneState3D:
@@ -562,6 +605,16 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
     def target(self) -> np.ndarray:
         """Convenience property exposing the target waypoint."""
         return self._goal
+
+    @property
+    def obstacles(self) -> List[ObstacleSphere3D]:
+        """Public read-only snapshot of the active obstacle set.
+
+        Evaluation and visualization code should use this telemetry
+        interface instead of the private ``_obstacles`` attribute. The list
+        is copied so callers cannot mutate environment state.
+        """
+        return list(self._obstacles)
 
     def reset(
         self,
@@ -613,6 +666,7 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
         self._position = self.default_start.copy()
         self._velocity = np.zeros(3, dtype=np.float64)
         self._goal = self.default_goal.copy()
+        self._gust_velocity = np.zeros(3, dtype=np.float64)
 
         self.kinematics.reset(self._position, self._velocity)
 
@@ -644,7 +698,19 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
 
         self._current_step += 1
 
-        acc_command = act_arr * self.kinematics.max_acceleration
+        # Exact discrete OU update: stationary per-axis gust standard deviation
+        # approaches sigma/sqrt(2*theta), as specified by the shift config.
+        if self.gust_sigma > 0.0:
+            noise = self.np_random.normal(size=3)
+            self._gust_velocity += (
+                -self.gust_theta * self._gust_velocity * self.kinematics.dt
+                + self.gust_sigma * np.sqrt(self.kinematics.dt) * noise
+            )
+            gust_magnitude = float(np.linalg.norm(self._gust_velocity))
+            if gust_magnitude > 4.0:
+                self._gust_velocity *= 4.0 / gust_magnitude
+        wind_acceleration = self.kinematics.linear_damping * self._wind_velocity(self._position)
+        acc_command = act_arr * self.kinematics.max_acceleration + wind_acceleration
         new_pos, new_vel = self.kinematics.step(acc_command)
         self._position = new_pos
         self._velocity = new_vel
@@ -683,6 +749,10 @@ class DroneNavigation3DEnv(AdaptiveRLEnv[np.ndarray, np.ndarray]):
 
         if self._current_step >= self.max_steps and not terminated:
             truncated = True
+
+        info["terminated"] = terminated
+        info["truncated"] = truncated
+        info["TimeLimit.truncated"] = truncated
 
         if self.render_mode == "human":
             print(self.render())

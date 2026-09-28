@@ -58,6 +58,22 @@ def register_default_environments() -> None:
             ),
         )
 
+    if "drone_disturbed" not in list_environments():
+        register(
+            "drone_disturbed",
+            lambda **kwargs: DroneNavigation3DEnv(**kwargs),
+            metadata=EnvironmentMetadata(
+                name="drone_disturbed",
+                description="Drone navigation with deterministic steady-wind and OU gust parameters.",
+                observation_type="box",
+                action_type="continuous",
+                version="0.2.0",
+                max_episode_steps=200,
+                reward_range=(-100.0, 100.0),
+                tags=["continuous", "drone", "distribution-shift", "wind", "gust"],
+            ),
+        )
+
 
 # Automatically register default environments
 register_default_environments()

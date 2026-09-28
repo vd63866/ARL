@@ -235,6 +235,9 @@ def test_drone_boundary_collision_termination() -> None:
 
     assert terminated is True
     assert info["collision"] is True
+    assert info["terminated"] is True
+    assert info["truncated"] is False
+    assert info["TimeLimit.truncated"] is False
     assert reward == env.collision_reward
     env.close()
 
@@ -258,7 +261,60 @@ def test_drone_truncation_at_max_steps() -> None:
     assert trunc is True
     assert term is False
     assert info["step"] == max_steps
+    assert info["terminated"] is False
+    assert info["truncated"] is True
+    assert info["TimeLimit.truncated"] is True
     env.close()
+
+
+def test_drone_step_outcome_metadata_matches_gymnasium_signals() -> None:
+    """Step metadata reflects final Gymnasium termination and truncation signals."""
+    successful_env = DroneNavigation3DEnv(
+        bounds=(20.0, 20.0, 10.0),
+        start_pos=np.array([10.0, 10.0, 5.0]),
+        goal_pos=np.array([10.5, 10.0, 5.0]),
+        target_radius=1.5,
+        max_steps=1,
+        num_obstacles=0,
+    )
+    successful_env.reset(seed=5)
+    transition = successful_env.step(np.zeros(3, dtype=np.float32))
+    assert len(transition) == 5
+    observation, reward, terminated, truncated, info = transition
+    assert successful_env.observation_space.contains(observation)
+    assert isinstance(reward, float)
+    assert terminated is True
+    assert truncated is False
+    assert info["terminated"] is terminated
+    assert info["truncated"] is truncated
+    assert info["TimeLimit.truncated"] is truncated
+    assert info["success"] is True
+    assert info["is_success"] is True
+    assert "position" in info
+    assert "distance_to_goal" in info
+    successful_env.close()
+
+    timeout_env = DroneNavigation3DEnv(
+        bounds=(30.0, 30.0, 15.0),
+        max_steps=1,
+        num_obstacles=0,
+    )
+    timeout_env.reset(seed=5)
+    observation, reward, terminated, truncated, info = timeout_env.step(
+        np.zeros(3, dtype=np.float32)
+    )
+    assert timeout_env.observation_space.contains(observation)
+    assert isinstance(reward, float)
+    assert terminated is False
+    assert truncated is True
+    assert info["terminated"] is terminated
+    assert info["truncated"] is truncated
+    assert info["TimeLimit.truncated"] is truncated
+    assert info["success"] is False
+    assert info["collision"] is False
+    assert "position" in info
+    assert "distance_to_goal" in info
+    timeout_env.close()
 
 
 def test_drone_render_modes() -> None:
@@ -366,4 +422,20 @@ def test_drone_random_rollout_lifecycle() -> None:
     assert step_count <= 30
     assert "position" in step_info
     assert "distance_to_goal" in step_info
+    env.close()
+
+
+def test_drone_exposes_public_obstacle_interface() -> None:
+    """The environment exposes obstacles through a public read-only interface."""
+    env = DroneNavigation3DEnv(bounds=(20.0, 20.0, 10.0), max_steps=10, num_obstacles=3)
+    env.reset(seed=11)
+
+    obstacles = env.obstacles
+    assert len(obstacles) == 3
+    assert obstacles == env._obstacles
+
+    # The public getter returns a snapshot, not the live backing list.
+    obstacles.clear()
+    assert len(env.obstacles) == 3
+    assert len(env._obstacles) == 3
     env.close()

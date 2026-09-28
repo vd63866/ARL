@@ -9,23 +9,24 @@ This document is the normative, pre-specified experimental contract for evaluati
 > [!WARNING]
 > **Implementation Status**
 >
-> **[VERIFIED-CODE]** Current repository infrastructure trains on a nominal scenario, freezes the resulting policy, fingerprints it, and rejects any mutation during evaluation — see `src/adaptive_rl/experiments/shift_runner.py:180-205` at the pinned commit.
+> **[VERIFIED-CODE]** `src/adaptive_rl/benchmarking/adaptation_runner.py` now implements the Issue #265 drone TEST-B lifecycle: train once on nominal parameters, share the pre-shift and shock episodes, fork independent PPO/SAC policies, update only Adaptive between episodes B5–B14, and compute recovery from the paired trajectories. `tests/test_adaptation_smoke.py` exercises the CI-sized PPO path; both PPO and SAC real-environment smoke paths have been executed.
 >
-> **[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** The online Adaptive treatment defined in §4–§5. No online update/adaptation harness exists in the repository.
+> **[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** Four non-drone primary cells do not have an Issue #265 shift environment/configuration in this checkout. They remain inconclusive; the six-cell family claim cannot be evaluated from the drone cell alone.
 >
-> **[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** The per-episode derived seed schedule of §14 is not yet executed by any runner; the current runner evaluates the config-declared scenario seed sets (`shift_runner.py:198-204`).
+> **[NO RESEARCH RESULT]** No full ten-replicate scientific benchmark has been collected. Smoke execution validates software behavior only and does not establish empirical superiority or statistical significance.
 >
-> **PR #168 / Issue #98** is documentation plus this executable protocol mirror only. Nothing in this document should be read as claiming that any Adaptive cell is currently executable, that any result exists, or that the protocol has been validated on data.
+> **PR #168 / Issue #98** introduced this protocol and its executable constants/seed/recovery/statistics mirror. Issue #265 adds the drone TEST-B harness. Nothing here claims a full research result or empirical validation.
 
 **Status tags used throughout** (a value is what its tag says, nothing more):
 
 | Tag | Meaning |
 |---|---|
-| `[VERIFIED-CODE]` | Behavior verified by reading/reviewing repository source at the pinned commit |
+| `[VERIFIED-CODE]` | Behavior verified in the current repository source; frozen scientific values remain pinned to the protocol version |
+| `[SMOKE-VALIDATED]` | CI-sized or one-off smoke execution verified software behavior only; not research evidence |
 | `[VERIFIED-CONFIG]` | Value appears literally in the cited config file at the pinned commit |
 | `[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]` | Frozen requirement for a future harness; not present in the repository today |
 | `[FUTURE PROTOCOL VALUE]` | Pre-registered target that must be configured before that condition is executable |
-| `[FUTURE DESIGN DECISION]` | Must be frozen in a signed-off artifact **before any data is collected** (see §5.3) |
+| `[FUTURE DESIGN DECISION]` | Must be frozen in a signed-off artifact before that cell collects data |
 
 ## 2. Research Question
 
@@ -65,7 +66,7 @@ The primary test is one-sided, consistent with H1 (§18.2).
 
 ### 4.2 Train-once, clone, fork design
 
-**[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** Each replicate is executed as one shared segment followed by two arm segments:
+**[SMOKE-VALIDATED]** The drone TEST-B runner executes each replicate as one shared segment followed by two arm segments:
 
 ```
 TRAIN (seed = training_seed(i))          # one training run per replicate
@@ -92,7 +93,7 @@ No running normalization statistics exist in the repository (no VecNormalize or 
 
 ### 5.1 Block schedule
 
-**[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** Exactly `N_update = 10` update blocks exist, executed strictly between the termination of episode $k$ and the reset of episode $k+1$, for $k = 5, 6, \dots, 14$ (block identifiers $B_5, \dots, B_{14}$):
+**[SMOKE-VALIDATED]** Exactly `N_update = 10` update blocks execute strictly between the termination of episode $k$ and the reset of episode $k+1$, for $k = 5, 6, \dots, 14$ (block identifiers $B_5, \dots, B_{14}$):
 
 | Block | Executes between | Visible data (frozen) |
 |---|---|---|
@@ -115,7 +116,7 @@ An update block completes (or fails) **before** the next episode reset. A failed
 ### 5.3 What is frozen vs. what must still be frozen before execution
 
 * **Frozen now**: schedule of §5.1, data visibility, freeze windows, identical-seed rule, logging requirements, all constants in §24.
-* **[FUTURE DESIGN DECISION]** The adaptation algorithm itself (loss, epochs, learning rate, batch construction, buffer capacity) is not specified here because no harness exists to validate a specification against. Before any data is collected, a **Treatment Card** must be written and frozen (commit SHA recorded in the results artifact) that specifies these details under these constraints: (a) base-algorithm hyperparameters unchanged from the cell config except parameters declared in the Card; (b) no access to test/evaluation outcomes from episodes > k when executing $B_k$; (c) no seed other than the derived ones; (d) per-block logging of data used, parameter delta norm, and fingerprint. Executing without a frozen Card is a protocol violation.
+* **[SMOKE-VALIDATED]** The adaptation algorithm, buffer construction, native PPO/SAC update details, inherited hyperparameters, and failure behavior are frozen in `docs/research/TREATMENT_CARD.md`. Artifacts record the Card SHA-256. Smoke tests are not evidence of outcome-based tuning or scientific validity.
 
 ## 6. Operational Definition of Recovery
 
@@ -205,7 +206,7 @@ Pre-registered training budget and config pinned to §15; final-checkpoint rule 
 
 ## 9. Baseline
 
-**Fixed arm**: trained on the nominal distribution; policy frozen and fingerprinted immediately after training; evaluated under shift with weights locked at all times (`shift_runner.py:180-205` already enforces fingerprint invariance for the existing benchmark `[VERIFIED-CODE]`).
+**Fixed arm**: trained on the nominal distribution; policy frozen and fingerprinted immediately after training; evaluated under shift with weights locked at all times (`src/adaptive_rl/benchmarking/adaptation_runner.py` verifies the Fixed fingerprint against the frozen fingerprint `[SMOKE-VALIDATED]`).
 
 ## 10. Evaluation Environments
 
@@ -220,9 +221,9 @@ At the pinned commit `[VERIFIED-CODE src/adaptive_rl/environments/__init__.py:60
 
 ## 11. Training Distribution
 
-All training uses only the nominal configuration and only the TRAIN seed pool `[1000..1014]` `[VERIFIED-CONFIG]`. Test seeds and shift parameters must not leak into training; post-hoc scenario selection is prohibited. The existing runner enforces this via `TrainingDistributionWrapper` and the seed-containment audit (`shift_runner.py:143-177`) `[VERIFIED-CODE]`.
+Issue #265 training uses only `environment.parameters` from `configs/drone_distribution_shift.yaml`; the distinct TEST-B `shift_parameters` are merged by the runner only after training and the shared pre-shift evaluation. Derived update/evaluation seeds are validated against the frozen configuration seed pools. The runner's separate configuration fields make the TEST-B values unavailable to the training environment constructor `[SMOKE-VALIDATED]`.
 
-**[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** Each replicate trains with `config.seed := training_seed(i)` (§14.1), replacing the config default (`42`/`123`). The containment audit must still pass afterwards; this has not been exercised.
+**[SMOKE-VALIDATED]** Each replicate trains with the selected preregistered `training_seed`; the trainer receives a per-replicate config copy and the source config is unchanged.
 
 ## 12. Distribution Shifts
 
@@ -323,7 +324,7 @@ Step 8 — CAUSAL RECOVERY MEASUREMENT
   adaptive_rl.protocol.recovery, not ad-hoc scripts.
 ```
 
-**Common-random-number property** `[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]`: episodes are reseeded at every reset, and environment exogenous noise is drawn from the seeded episode RNG in a way that does not depend on the action taken (e.g. drone gusts: `disturbed_drone.py:637,649` pass `rng=self.np_random`; `wind.py:85` draws `rng.normal(size=3)` per step) `[VERIFIED-CODE]`. Both arms therefore see the same exogenous noise stream for episode $j$ *up to the point where episode length diverges* (the number of RNG draws per episode is action-dependent). CRN alignment is exact for the shared segment and partial-by-construction for the arm segment; it is a variance-reduction property, not a claim of identical trajectories.
+**Common-random-number property** `[SMOKE-VALIDATED]`: episodes are reseeded at every reset, and drone gust noise is drawn from the seeded environment RNG once per step. Both arms therefore receive the same exogenous noise stream for episode $j$ up to the point where episode length diverges (the number of RNG draws per episode is action-dependent). CRN alignment is exact for the shared segment and partial-by-construction for the arm segment; it is a variance-reduction property, not a claim of identical trajectories.
 
 ## 14. Seed Protocol
 
@@ -339,7 +340,7 @@ TRAINING_SEEDS = [31001, 31002, 31003, 31004, 31005, 31006, 31007, 31008, 31009,
 
 ### 14.2 Derived episode/block seeds — exact specification
 
-**[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]** There are 400 derived values per schedule (10 seeds × (15 pre + 15 post + 10 update)). The derivation is SHA-256, **not** Python's `hash()` (which is salted per process by `PYTHONHASHSEED`):
+**[VERIFIED-CODE]** There are 400 derived values per schedule (10 seeds × (15 pre + 15 post + 10 update)). The derivation is SHA-256, **not** Python's `hash()` (which is salted per process by `PYTHONHASHSEED`):
 
 ```
 payload  = f"{training_seed}|{phase}|{index}".encode("utf-8")
@@ -369,11 +370,11 @@ value    = int.from_bytes(digest[:4], byteorder="big", signed=False) & 0x7FFFFFF
 schedule_fingerprint = 65939167572731c99599c382ac50cf3fddbba3cf758305764392f13b2e4efa67
 ```
 
-Both arms record this fingerprint in their artifacts; a mismatch between arms (or against this document) invalidates the replicate. Any change to seeds, indices, or phases changes the fingerprint and therefore fails `tests/test_protocol_doc_sync.py`.
+The research artifact and each replicate record this fingerprint, shared by both arms; a mismatch against this document invalidates the replicate. Any change to seeds, indices, or phases changes the fingerprint and therefore fails `tests/test_protocol_doc_sync.py`.
 
 ### 14.4 RNG initialization and train/test disjointness
 
-Every episode reset uses `reset(seed = derived_value)` so run order cannot leak state across episodes `[PROTOCOL REQUIREMENT — NOT IMPLEMENTED]`. Training-side seeding remains `random.seed` / `np.random.seed` / `torch.manual_seed` / CUDA seeds (`trainer.py:120-126`) `[VERIFIED-CODE]`. Train/test seed-set disjointness for the **config pools** is audited by `shift_runner.py:162-177` `[VERIFIED-CODE]`; disjointness of the **derived schedule** from those pools is enforced by `validate_schedule()` (§14.2). Determinism is **not** claimed across hardware/library versions (§25).
+Every pre/post episode reset uses `reset(seed = derived_value)` and every update block uses its corresponding derived update seed `[SMOKE-VALIDATED]`. Training-side seeding remains `random.seed` / `np.random.seed` / `torch.manual_seed` / CUDA seeds in `trainer.py`. Disjointness of the derived schedule from training seeds and config pools is enforced by `validate_schedule()` (§14.2). Determinism is **not** claimed across hardware/library versions (§25).
 
 ## 15. Training Budgets (Pinned)
 
@@ -405,8 +406,8 @@ The deterministic pre-declared rule is the **final training checkpoint** at the 
 |---|---|---|
 | 1 | `gridworld/ppo` | No — no shift config; moderate is design-reference only |
 | 2 | `traffic_signal/ppo` | No — moderate `[FUTURE PROTOCOL VALUE]` |
-| 3 | `drone_disturbed/ppo` | No — Adaptive harness absent (Fixed benchmark runnable) |
-| 4 | `drone_disturbed/sac` | No — Adaptive harness absent (budget/config exist) |
+| 3 | `drone_disturbed/ppo` | Yes — runner and smoke path implemented; full ten-replicate data not collected |
+| 4 | `drone_disturbed/sac` | Yes — runner and smoke path implemented; full ten-replicate data not collected |
 | 5 | `navigation_2d/ppo` | No — moderate `[FUTURE PROTOCOL VALUE]`; harness absent |
 | 6 | `navigation_2d/sac` | No — config absent; harness absent |
 
@@ -491,11 +492,11 @@ Pairwise-complete exclusion in the primary analysis can create attrition bias if
 
 ## 20. Reporting Requirements
 
-### 20.1 Existing artifact (Fixed benchmark) `[VERIFIED-CODE src/adaptive_rl/evaluation/shift_benchmark.py:523-557]`
+### 20.1 Historical Fixed-benchmark artifact (pinned protocol reference)
 
 `ShiftBenchmarkReport` stores (actual field names): `schema_version`, `experiment_name`, `environment_name`, `algorithm_name`, `deterministic`, `total_training_timesteps`, `train_seeds`, `test_seeds`, **`scenarios`** (list of `ScenarioResult`), `recovery_definition`, `training_provenance`, `environment_provenance`, `config_sha256`, `metadata`.
 
-Per scenario: `scenario_name`, `role`, `seeds`, `environment_overrides`, `effective_environment_parameters`, `metrics`, `recovery`, **`episodes`** (list of `EpisodeBenchmarkRecord`), `gaps`, `policy_fingerprint`.
+The legacy Fixed-benchmark implementation at the pinned protocol revision stored per scenario: `scenario_name`, `role`, `seeds`, `environment_overrides`, `effective_environment_parameters`, `metrics`, `recovery`, **`episodes`** (list of `EpisodeBenchmarkRecord`), `gaps`, `policy_fingerprint`. That legacy module is not present in the current checkout; Issue #265 writes its own explicit adaptation schema.
 
 Per episode record (`shift_benchmark.py:466-490`): `seed`, `reward`, `length`, `success`, `collision`, `terminated`, `truncated`, `recovery_times`, `recovery_events`, `recovery_completed`, `recovery_censored`.
 
@@ -503,9 +504,9 @@ Per episode record (`shift_benchmark.py:466-490`): `seed`, `reward`, `length`, `
 
 ### 20.2 Derived research quantities
 
-$P_{pre}$, $P_0$, $P(t)$, $R(t)$, $\tau$, $T_H$, status, δ, `delta_min`, and the update-block log are **not native fields** of the current report; they must be derived from episode records by `src/adaptive_rl/protocol/recovery.py` (never ad hoc) and stored in a derived artifact.
+$P_{pre}$, $P_0$, $P(t)$, $R(t)$, $\tau$, $T_H$, status, δ, `delta_min`, and the update-block log are derived from episode records; the Issue #265 artifact stores them using `src/adaptive_rl/protocol/recovery.py` (never ad hoc equations).
 
-### 20.3 Future Adaptive artifact (required contents)
+### 20.3 Issue #265 artifact contents
 
 Per replicate × arm: training seed, all three phase-seed lists used, schedule fingerprint (§14.3), `PROTOCOL_VERSION`, pinned commit SHA, config SHA-256, pre-shift/shock/post-shift return vectors, per-episode success flags, $P_{pre}$, $P_0$, δ, `delta_min`, $P(t)$ and $R(t)$ trajectories, predicate vector, $\tau$, $T_H$, status; per block: block id, episode range, derived update seed, data-episode indices, parameter-delta norm, fingerprint before/after; plus environment/library provenance (`environment_provenance` already exists) including numpy version (bootstrap dependency, §18.3).
 
@@ -520,13 +521,13 @@ Per replicate × arm: training seed, all three phase-seed lists used, schedule f
 
 | Threat | Why it matters | Mitigation | Remaining limitation |
 |---|---|---|---|
-| Treatment-contaminated $P_0$ | Adaptive updating before $P_0$ is measured breaks normalization | Shared single execution of episodes 1–5 (§4.2); $B_5$ strictly after episode 5 | Depends on future harness honoring the ordering contract (§5.1–5.2) |
+| Treatment-contaminated $P_0$ | Adaptive updating before $P_0$ is measured breaks normalization | Shared single execution of episodes 1–5 (§4.2); $B_5$ strictly after episode 5 | Full ten-replicate protocol execution remains unverified |
 | `no_degradation` convention | $T_H = 0$ anchors the distribution without adaptation evidence | Convention retained, status always labeled; arm-invariant so $D_i = 0$ exactly | Can still shift the *level* of $T_H$ vs other studies; comparisons must match conventions |
 | Finite-horizon truncation | $T_H = 15$ for non-recovery makes the estimand a truncated mean | Estimand explicitly finite-horizon; right-censoring labeled, never extrapolated | Not a claim about true recovery-time distributions |
 | Normality of $D_i$ (t-test) | Primary test assumes it; $n = 8..10$ cannot verify it | Sensitivities (§18.3) target median/pseudomedian/resampling; disagreement must be reported | Type I/II error may deviate from nominal if strongly violated |
 | `MIN_VALID_N = 8` threshold | A cell at exactly 8 has less power than one at 10 | Rule frozen pre-data; per-cell $N_{valid}$ always reported | Power is unquantified; no formal power analysis (§25) |
 | Failed-run attrition | Excluding crashes can bias the contrast | Pairwise exclusion; per-arm failure counts; two-sided $[0,H]$ imputation bounds | Counterfactual $T_H$ of crashed runs unobservable |
-| Adaptive harness absent | Nothing in the treatment sections is executable | Protocol preregistered before implementation; status tags | Actual adaptation behavior entirely untested |
+| Partial cell coverage | Only the drone PPO/SAC cells have the Issue #265 runner in this checkout | Missing cells remain explicitly inconclusive; no six-cell family claim | GridWorld, Traffic Signal, and Navigation cells are unimplemented |
 | Unequal compute | Adaptive adds online compute | Declared part of the intervention; Fixed budget unchanged | Deployment latency/cost unmeasured |
 | Training non-determinism | No cudnn/deterministic-algorithm flags exist (`trainer.py:120-126`) | Train-once design: one run serves both arms (§4.2) | Cross-machine retraining may not reproduce weights; recorded fingerprint detects it |
 | CRN partial alignment | Episode lengths are action-dependent | Reseeding per episode; alignment stated as partial-by-construction (§13) | Variance reduction weaker than exact pairing of noise |
@@ -541,7 +542,7 @@ Per replicate × arm: training seed, all three phase-seed lists used, schedule f
 * [ ] Config YAMLs archived at the pinned commit; `config_sha256` recorded.
 * [ ] All 400 derived seeds logged; schedule fingerprint equals `65939167572731c99599c382ac50cf3fddbba3cf758305764392f13b2e4efa67` in both arms.
 * [ ] `validate_schedule()` run on the artifact's schedule with zero violations (uniqueness, range, disjointness).
-* [ ] Config-pool disjointness verified by the existing runner audit (`shift_runner.py:162-177`) **and** by `validate_schedule()`.
+* [ ] Training receives nominal parameters only; the runner withholds TEST-B parameters until after shared pre-shift evaluation, and `validate_schedule()` passes.
 * [ ] Train-once/fork design confirmed: one training fingerprint per replicate, both arms fork from it; Fixed arm fingerprint unchanged at end.
 * [ ] $P_0$ measured in the shared segment, pre-$B_5$; block ordering log shows $B_5$ strictly between episodes 5 and 6.
 * [ ] Per-block log complete for $B_5..B_{14}$ (10 blocks, no block after episode 15).
@@ -549,7 +550,7 @@ Per replicate × arm: training seed, all three phase-seed lists used, schedule f
 * [ ] Primary test, sensitivities, Holm, and `decide_family()` executed from `adaptive_rl.protocol.statistics`.
 * [ ] Per-cell $N_{valid}$, failure counts by arm, and both imputation directions reported.
 * [ ] Doc-sync tests pass: `python -m pytest tests/test_protocol_seed_schedule.py tests/test_protocol_recovery.py tests/test_protocol_statistics.py tests/test_protocol_doc_sync.py`.
-* [ ] Treatment Card (§5.3) committed with SHA recorded before any data collection.
+* [ ] Treatment Card (§5.3) frozen before a scientific run and its SHA recorded in the artifact.
 
 ## 24. Executable Protocol Mirror
 

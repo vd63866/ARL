@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import csv
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -20,18 +21,36 @@ from adaptive_rl.evaluation.metrics import (
     StandardizedExperimentMetrics,
     compute_trajectory_metrics,
 )
+from adaptive_rl.evaluation.statistics import MetricStatistics, summarize_seed_values
 
 
 @dataclass(frozen=True)
 class EpisodeEvaluationRecord:
-    """Record for a single evaluation episode."""
+    """Record for a single evaluation episode.
+
+    Seed semantics:
+        ``evaluation_group_seed`` is the requested evaluation seed and is the
+        statistical grouping unit used by :meth:`Evaluator.evaluate_seeds`.
+        It is ``None`` for single-seed :meth:`Evaluator.evaluate` runs, which
+        are not organized into seed groups. ``episode_reset_seed`` is the value
+        actually passed to ``env.reset(seed=...)`` for this episode.
+
+    Legacy fields:
+        ``seed`` and ``episode_seed`` are retained for backward compatibility.
+        ``episode_seed`` mirrors ``episode_reset_seed``. ``seed`` holds the
+        reset seed for single-seed runs and the group seed for multi-seed runs;
+        prefer the explicit accessors above when interpreting results.
+    """
 
     episode_index: int
     seed: Optional[int]
     return_value: float
     episode_length: int
-    success: bool
-    collision: bool
+    success: Optional[bool]
+    collision: Optional[bool]
+    truncated: bool
+    episode_seed: Optional[int] = None
+    evaluation_group_seed: Optional[int] = None
     collision_type: Optional[str] = None
     path_length: Optional[float] = None
     straight_line_distance: Optional[float] = None
@@ -41,15 +60,24 @@ class EpisodeEvaluationRecord:
     max_acceleration: Optional[float] = None
     timeout: bool = False
 
+    @property
+    def episode_reset_seed(self) -> Optional[int]:
+        """Actual ``env.reset(seed=...)`` value for this episode."""
+        return self.episode_seed
+
     def to_dict(self) -> Dict[str, Any]:
         data: Dict[str, Any] = {
             "episode_index": self.episode_index,
+            "evaluation_group_seed": self.evaluation_group_seed,
+            "episode_reset_seed": self.episode_reset_seed,
             "seed": self.seed,
             "return": self.return_value,
             "episode_length": self.episode_length,
             "success": self.success,
             "collision": self.collision,
+            "truncated": self.truncated,
             "timeout": self.timeout,
+            "episode_seed": self.episode_seed,
         }
         if self.collision_type is not None:
             data["collision_type"] = self.collision_type
@@ -68,8 +96,120 @@ class EpisodeEvaluationRecord:
         return data
 
 
+@dataclass(frozen=True)
+class SeedEvaluationSummary:
+    """Episode-level summary for one evaluation seed group.
+
+    ``seed`` is the requested evaluation seed (the statistical grouping unit),
+    not an episode reset seed. :attr:`evaluation_group_seed` exposes the same
+    value under an explicit name.
+    """
+
+    seed: int
+    episodes: int
+    success_rate: float | None
+    collision_rate: float | None
+    truncation_rate: float | None
+    mean_reward: float
+    std_reward: float
+    mean_episode_length: float
+    std_episode_length: float
+    path_length: float | None
+
+    @property
+    def evaluation_group_seed(self) -> int:
+        """Requested evaluation seed; the unit used for cross-seed statistics."""
+        return self.seed
+
+    def to_dict(self) -> dict[str, int | float | None]:
+        return {
+            "seed": self.seed,
+            "evaluation_group_seed": self.evaluation_group_seed,
+            "episodes": self.episodes,
+            "success_rate": self.success_rate,
+            "collision_rate": self.collision_rate,
+            "truncation_rate": self.truncation_rate,
+            "mean_reward": self.mean_reward,
+            "std_reward": self.std_reward,
+            "mean_episode_length": self.mean_episode_length,
+            "std_episode_length": self.std_episode_length,
+            "path_length": self.path_length,
+        }
+
+
+@dataclass(frozen=True)
+class MultiSeedEvaluationResult:
+    """Complete multi-seed result retaining episodes and seed-level identity.
+
+    ``seeds`` are evaluation group seeds; each group runs
+    ``episodes_per_seed`` episodes whose actual reset seeds are derived from
+    the group seed and recorded per episode as ``episode_reset_seed``.
+    """
+
+    seeds: list[int]
+    episodes_per_seed: int
+    deterministic: bool
+    per_seed: list[SeedEvaluationSummary]
+    episodes: list[EpisodeEvaluationRecord]
+    aggregate: dict[str, MetricStatistics]
+    environment: str
+
+    @property
+    def total_episodes(self) -> int:
+        return len(self.episodes)
+
+    @property
+    def evaluation_group_seeds(self) -> list[int]:
+        """Requested evaluation seeds; the grouping unit for cross-seed statistics."""
+        return list(self.seeds)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "metadata": {
+                "seeds": list(self.seeds),
+                "evaluation_group_seeds": list(self.seeds),
+                "seed_count": len(self.seeds),
+                "seed_semantics": (
+                    "seeds are evaluation group seeds (the statistical grouping unit); "
+                    "episodes within a group use derived episode_reset_seed values"
+                ),
+                "episodes_per_seed": self.episodes_per_seed,
+                "total_episodes": self.total_episodes,
+                "deterministic": self.deterministic,
+                "environment": self.environment,
+                "confidence_interval": "two-sided 95% Student's t interval across seed summaries; "
+                "sample standard deviation; unavailable when fewer than two values exist",
+                "duplicate_seed_policy": "rejected",
+            },
+            "episodes": [record.to_dict() for record in self.episodes],
+            "per_seed": [summary.to_dict() for summary in self.per_seed],
+            "aggregate": {
+                name: statistics.to_dict() for name, statistics in self.aggregate.items()
+            },
+        }
+
+
 class Evaluator:
-    """Standardized multi-episode evaluation engine for drone navigation."""
+    """Standardized multi-episode evaluation engine for drone navigation.
+
+    Environment telemetry contract:
+        Every episode always records return, length, and the Gymnasium
+        truncation flag. Additional outcomes come from the environment ``info``
+        dict and are optional: ``success``/``is_success``, ``collision``,
+        ``collision_type``, ``position``, ``velocity``, ``acceleration``.
+        When an environment does not report an outcome, the metric is
+        ``None`` (never ``0.0``), so non-spatial environments remain valid
+        evaluation targets.
+
+    Drone-specific telemetry:
+        Collision typing, obstacle clearance, path length, and path
+        efficiency describe the 3D drone navigation task and are only
+        available when the environment exposes positions and obstacles.
+        They must not be read as universal environment metrics. Obstacle
+        geometry is read from the public ``unwrapped.obstacles`` interface
+        when available, falling back to the private ``_obstacles`` attribute
+        for environments that predate it.
+    """
 
     def __init__(
         self,
@@ -126,8 +266,9 @@ class Evaluator:
         self.last_episode_records = []
         rewards: List[float] = []
         lengths: List[int] = []
-        successes: List[bool] = []
-        collisions: List[bool] = []
+        successes: List[Optional[bool]] = []
+        collisions: List[Optional[bool]] = []
+        truncations: List[bool] = []
         obstacle_collisions: List[bool] = []
         boundary_collisions: List[bool] = []
         timeouts: List[bool] = []
@@ -159,6 +300,9 @@ class Evaluator:
             ep_length = 0
             done = False
             last_info = dict(info or {})
+            was_truncated = False
+            previous_position = self._position_from_info(last_info)
+            path_length = 0.0 if previous_position is not None else None
 
             # Trajectory tracking for trajectory-quality and safety metrics
             positions: List[np.ndarray] = []
@@ -177,9 +321,9 @@ class Evaluator:
 
             goal = last_info.get("goal")
             unwrapped_env = getattr(self.env, "unwrapped", self.env)
-            obstacles = getattr(unwrapped_env, "_obstacles", None)
+            obstacles = getattr(unwrapped_env, "obstacles", None)
             if obstacles is None:
-                obstacles = getattr(unwrapped_env, "obstacles", None)
+                obstacles = getattr(unwrapped_env, "_obstacles", None)
 
             while not done:
                 if self.algorithm is not None:
@@ -193,9 +337,19 @@ class Evaluator:
                 ep_reward += float(reward)
                 ep_length += 1
                 last_info = dict(step_info or {})
+                was_truncated = bool(truncated)
+                current_position = self._position_from_info(step_info)
+                if (
+                    path_length is not None
+                    and previous_position is not None
+                    and current_position is not None
+                    and current_position.shape == previous_position.shape
+                ):
+                    path_length += float(np.linalg.norm(current_position - previous_position))
+                else:
+                    path_length = None
+                previous_position = current_position
                 done = terminated or truncated
-
-                # Track position, velocity, and acceleration
                 step_pos = last_info.get("position")
                 if step_pos is not None:
                     positions.append(np.asarray(step_pos, dtype=np.float64).copy())
@@ -208,22 +362,22 @@ class Evaluator:
                 elif hasattr(unwrapped_env, "kinematics"):
                     accelerations.append(unwrapped_env.kinematics.state.acceleration.copy())
 
-            is_success = bool(last_info.get("success", False))
-            is_collision = bool(last_info.get("collision", False))
+            success_value = last_info.get("success", last_info.get("is_success"))
+            collision_value = last_info.get("collision")
+            is_success = bool(success_value) if success_value is not None else None
+            is_collision = bool(collision_value) if collision_value is not None else None
             collision_type = str(last_info.get("collision_type", "none"))
-
-            is_obs_coll = is_collision and (collision_type == "obstacle")
-            is_bound_coll = is_collision and collision_type.startswith("boundary")
-            is_timeout = bool(truncated) or (
-                not is_success
-                and not is_collision
-                and ep_length >= getattr(self.env, "max_steps", 200)
-            )
+            is_obs_coll = bool(is_collision) and collision_type == "obstacle"
+            is_bound_coll = bool(is_collision) and collision_type.startswith("boundary")
+            is_timeout = was_truncated
 
             rewards.append(ep_reward)
             lengths.append(ep_length)
             successes.append(is_success)
             collisions.append(is_collision)
+            truncations.append(was_truncated)
+            if not math.isfinite(ep_reward):
+                raise ValueError(f"Episode {ep} produced a non-finite cumulative reward.")
             obstacle_collisions.append(is_obs_coll)
             boundary_collisions.append(is_bound_coll)
             timeouts.append(is_timeout)
@@ -236,7 +390,7 @@ class Evaluator:
                 obstacles=obstacles,
             )
 
-            ep_path_len = traj_metrics["path_length"]
+            ep_path_len = path_length
             ep_straight_dist = traj_metrics["straight_line_distance"]
             ep_path_eff = traj_metrics["path_efficiency"]
             ep_min_clear = traj_metrics["min_obstacle_clearance"]
@@ -264,6 +418,8 @@ class Evaluator:
                     episode_length=ep_length,
                     success=is_success,
                     collision=is_collision,
+                    truncated=was_truncated,
+                    episode_seed=seed,
                     collision_type=collision_type if is_collision else None,
                     path_length=ep_path_len,
                     straight_line_distance=ep_straight_dist,
@@ -282,8 +438,17 @@ class Evaluator:
         mean_len = float(np.mean(lengths))
         std_len = float(np.std(lengths))
 
-        succ_rate = float(sum(successes) / num_episodes)
-        coll_rate = float(sum(collisions) / num_episodes)
+        observed_successes = [value for value in successes if value is not None]
+        observed_collisions = [value for value in collisions if value is not None]
+        succ_rate = (
+            float(sum(observed_successes) / len(observed_successes)) if observed_successes else None
+        )
+        coll_rate = (
+            float(sum(observed_collisions) / len(observed_collisions))
+            if observed_collisions
+            else None
+        )
+        trunc_rate = float(sum(truncations) / num_episodes)
         time_rate = float(sum(timeouts) / num_episodes)
         mean_path_eff = float(np.mean(path_efficiencies)) if path_efficiencies else None
 
@@ -326,8 +491,11 @@ class Evaluator:
             additional_metrics={
                 "all_rewards": rewards,
                 "all_lengths": lengths,
+                "all_path_lengths": [record.path_length for record in self.last_episode_records],
                 "deterministic": deterministic,
                 "base_seed": base_seed,
+                "truncation_count": int(sum(truncations)),
+                "timeout_rate": trunc_rate,
                 "split": split,
                 "seeds": list(seeds) if seeds is not None else None,
                 "mean_path_length": mean_path_len,
@@ -347,10 +515,157 @@ class Evaluator:
                 "boundary_collision_count": bound_coll_count,
                 "obstacle_collision_rate": obs_coll_rate,
                 "boundary_collision_rate": bound_coll_rate,
-                "timeout_rate": time_rate,
                 "truncation_rate": time_rate,
             },
         )
+
+    @staticmethod
+    def _position_from_info(info: dict[str, Any]) -> np.ndarray | None:
+        position = info.get("position")
+        if position is None:
+            return None
+        try:
+            coordinates = np.asarray(position, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if coordinates.ndim != 1 or coordinates.size == 0:
+            return None
+        if not np.all(np.isfinite(coordinates)):
+            return None
+        return coordinates
+
+    def evaluate_seeds(
+        self,
+        seeds: Sequence[int],
+        episodes_per_seed: int,
+        deterministic: bool = True,
+    ) -> MultiSeedEvaluationResult:
+        """Evaluate a policy independently for each explicit seed group.
+
+        ``seeds`` are evaluation group seeds: the statistical grouping unit
+        for cross-seed summaries. Each group runs ``episodes_per_seed``
+        episodes whose actual ``env.reset`` seeds are the disjoint block
+        ``seed * episodes_per_seed + episode_index``; both values are recorded
+        per episode as ``evaluation_group_seed`` and ``episode_reset_seed``.
+
+        Duplicate seeds are rejected because repeated entries do not represent
+        independent test conditions and would over-weight that environment.
+        """
+        seed_values = list(seeds)
+        if not seed_values:
+            raise ValueError("Evaluation seeds must not be empty.")
+        if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seed_values):
+            raise ValueError("Evaluation seeds must be integers.")
+        if any(seed < 0 for seed in seed_values):
+            raise ValueError("Evaluation seeds must be non-negative.")
+        if len(set(seed_values)) != len(seed_values):
+            raise ValueError("Evaluation seeds must be unique; duplicate seeds are not allowed.")
+        if isinstance(episodes_per_seed, bool) or not isinstance(episodes_per_seed, int):
+            raise ValueError("episodes_per_seed must be an integer.")
+        if episodes_per_seed <= 0:
+            raise ValueError(f"episodes_per_seed must be positive, got {episodes_per_seed}.")
+        if not isinstance(deterministic, bool):
+            raise ValueError("deterministic must be a boolean.")
+
+        all_records: list[EpisodeEvaluationRecord] = []
+        seed_summaries: list[SeedEvaluationSummary] = []
+        for seed in seed_values:
+            episode_seed_base = seed * episodes_per_seed
+            metrics = self.evaluate(
+                num_episodes=episodes_per_seed,
+                deterministic=deterministic,
+                base_seed=episode_seed_base,
+            )
+            records = [
+                replace(record, seed=seed, evaluation_group_seed=seed, episode_index=index)
+                for index, record in enumerate(self.last_episode_records)
+            ]
+            all_records.extend(records)
+            path_lengths = [
+                record.path_length for record in records if record.path_length is not None
+            ]
+            seed_summaries.append(
+                SeedEvaluationSummary(
+                    seed=seed,
+                    episodes=metrics.episodes,
+                    success_rate=metrics.success_rate,
+                    collision_rate=metrics.collision_rate,
+                    truncation_rate=metrics.truncation_rate,
+                    mean_reward=metrics.mean_reward,
+                    std_reward=metrics.std_reward,
+                    mean_episode_length=metrics.mean_episode_length,
+                    std_episode_length=metrics.std_episode_length,
+                    path_length=(
+                        float(math.fsum(path_lengths) / len(path_lengths)) if path_lengths else None
+                    ),
+                )
+            )
+
+        metric_names = (
+            "mean_reward",
+            "success_rate",
+            "collision_rate",
+            "truncation_rate",
+            "mean_episode_length",
+            "std_reward",
+            "std_episode_length",
+            "path_length",
+        )
+        aggregate = {
+            name: summarize_seed_values([getattr(summary, name) for summary in seed_summaries])
+            for name in metric_names
+        }
+        self.last_episode_records = all_records
+        return MultiSeedEvaluationResult(
+            seeds=seed_values,
+            episodes_per_seed=episodes_per_seed,
+            deterministic=deterministic,
+            per_seed=seed_summaries,
+            episodes=all_records,
+            aggregate=aggregate,
+            environment=self.env_name,
+        )
+
+    @staticmethod
+    def save_multiseed_report(
+        result: MultiSeedEvaluationResult,
+        json_path: str | Path,
+        csv_path: str | Path,
+    ) -> tuple[Path, Path]:
+        """Write the complete multi-seed result to stable JSON and aggregate CSV."""
+        json_target = Path(json_path)
+        csv_target = Path(csv_path)
+        json_target.parent.mkdir(parents=True, exist_ok=True)
+        csv_target.parent.mkdir(parents=True, exist_ok=True)
+
+        with json_target.open("w", encoding="utf-8") as handle:
+            json.dump(result.to_dict(), handle, indent=2, allow_nan=False)
+
+        columns = [
+            "metric",
+            "mean",
+            "std",
+            "ci95_lower",
+            "ci95_upper",
+            "sample_count",
+            "seed_count",
+            "episodes_per_seed",
+            "total_episodes",
+        ]
+        with csv_target.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            for metric, statistics in result.aggregate.items():
+                writer.writerow(
+                    {
+                        "metric": metric,
+                        **statistics.to_dict(),
+                        "seed_count": len(result.seeds),
+                        "episodes_per_seed": result.episodes_per_seed,
+                        "total_episodes": result.total_episodes,
+                    }
+                )
+        return json_target, csv_target
 
     @staticmethod
     def save_report(
